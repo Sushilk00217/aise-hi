@@ -1,0 +1,81 @@
+import pandas as pd
+import openai
+import lancedb
+from lancedb.embeddings import EmbeddingFunction
+from typing import List
+
+# Step 1: Load CSV file
+csv_file_path = "your_data.csv"  # Replace with actual file path
+df = pd.read_csv(csv_file_path)
+
+# Step 2: Prepare text chunks from the data
+def dataframe_to_text_chunks(df: pd.DataFrame) -> List[str]:
+    chunks = []
+    for index, row in df.iterrows():
+        chunk = " | ".join([f"{col}: {row[col]}" for col in df.columns])
+        chunks.append(chunk)
+    return chunks
+
+text_chunks = dataframe_to_text_chunks(df)
+
+# Step 3: Azure OpenAI Embedding Function
+class AzureOpenAIEmbedding(EmbeddingFunction):
+    def __init__(self, api_key, endpoint, deployment_name):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.deployment_name = deployment_name
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        openai.api_type = "azure"
+        openai.api_key = self.api_key
+        openai.api_base = self.endpoint
+        openai.api_version = "2023-05-15"
+
+        response = openai.Embedding.create(
+            input=texts,
+            engine=self.deployment_name
+        )
+        return [item["embedding"] for item in response["data"]]
+
+# Replace with your Azure OpenAI credentials
+embedding_function = AzureOpenAIEmbedding(
+    api_key="YOUR_AZURE_OPENAI_API_KEY",
+    endpoint="https://YOUR_RESOURCE_NAME.openai.azure.com/",
+    deployment_name="YOUR_EMBEDDING_DEPLOYMENT_NAME"
+)
+
+# Step 4: Create LanceDB and store embeddings
+db = lancedb.connect("lancedb_data")
+table = db.create_table("rag_table", data=[
+    {"text": chunk, "vector": embedding_function([chunk])[0]}
+    for chunk in text_chunks
+])
+
+# Step 5: Query function
+def query_rag_system(query: str) -> str:
+    # Embed the query
+    query_embedding = embedding_function([query])[0]
+
+    # Search LanceDB for relevant context
+    results = table.search(query_embedding).limit(3).to_list()
+    context = "\n".join([item["text"] for item in results])
+
+    # Generate answer using Azure OpenAI
+    openai.api_type = "azure"
+    openai.api_key = "YOUR_AZURE_OPENAI_API_KEY"
+    openai.api_base = "https://YOUR_RESOURCE_NAME.openai.azure.com/"
+    openai.api_version = "2023-05-15"
+
+    completion = openai.ChatCompletion.create(
+        engine="YOUR_CHAT_DEPLOYMENT_NAME",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Answer the question based on the following context:\n{context}\n\nQuestion: {query}"}
+        ]
+    )
+
+    return completion["choices"][0]["message"]["content"]
+
+# Example usage
+# answer = query_rag_system("What is the total revenue for Q1?")
+# print(answer)
