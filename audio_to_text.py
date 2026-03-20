@@ -1,1 +1,13 @@
-fix the issues
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.6
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+pypdf2==3.0.1
+sentence-transformers==2.3.1
+transformers==4.36.2
+torch==2.1.2
+huggingface-hub==0.20.2
+python-dotenv==1.0.0
+pydantic==2.5.3
+sqlalchemy==2.0.25
