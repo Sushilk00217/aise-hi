@@ -1,103 +1,153 @@
-import PyPDF2
-import time
+import os
 from typing import List, Dict
-from database import get_connection
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# LLM Configuration
+LLM_MODEL_NAME = os.getenv('LLM_MODEL', 'meta-llama/Llama-2-7b-chat-hf')
+HF_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
+
+llm_pipeline = None
 
 
-def extract_pdf_text(pdf_path: str) -> Dict:
+def get_llm_pipeline():
     """
-    Extract text from PDF page by page.
-    Returns a dictionary with page-level text and metadata.
+    Lazy load the LLM pipeline
+    Note: For production, you might want to use quantized models or API endpoints
     """
-    start_time = time.time()
-    pages_text = []
-    full_text = ""
+    global llm_pipeline
+    
+    if llm_pipeline is None:
+        print(f"Loading LLM model: {LLM_MODEL_NAME}")
+        print("Note: This may take several minutes and requires significant memory...")
+        
+        try:
+            # Check if CUDA is available
+            device = 0 if torch.cuda.is_available() else -1
+            
+            # Load tokenizer and model
+            tokenizer = AutoTokenizer.from_pretrained(
+                LLM_MODEL_NAME,
+                token=HF_TOKEN,
+                trust_remote_code=True
+            )
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                LLM_MODEL_NAME,
+                token=HF_TOKEN,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                trust_remote_code=True
+            )
+            
+            llm_pipeline = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=512,
+                temperature=0.7,
+                top_p=0.95,
+                repetition_penalty=1.15
+            )
+            
+            print("LLM loaded successfully!")
+            
+        except Exception as e:
+            print(f"Error loading LLM: {e}")
+            print("Falling back to a simpler model or mock response...")
+            # Fallback: you could use a smaller model or return mock responses
+            llm_pipeline = "mock"  # Placeholder for mock mode
+    
+    return llm_pipeline
+
+
+def generate_answer(query: str, context_chunks: List[Dict]) -> str:
+    """
+    Generate answer using LLaMA with retrieved context
+    """
+    
+    if not context_chunks:
+        return "No relevant information found in the documents."
+    
+    # Build context from chunks
+    context = "\n\n".join([
+        f"[{chunk.get('pdf_name', 'Document')} - Page {chunk['page_number']}]: {chunk['text']}"
+        for chunk in context_chunks
+    ])
+    
+    # Create prompt
+    prompt = f"""You are a helpful assistant that answers questions based on the provided context.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer: Based on the context provided, """
+    
     try:
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            num_pages = len(pdf_reader.pages)
-            for page_num in range(num_pages):
-                page = pdf_reader.pages[page_num]
-                page_text = page.extract_text()
-                pages_text.append({
-                    'page_number': page_num + 1,
-                    'text': page_text
-                })
-                full_text += f"\n--- Page {page_num + 1} ---\n{page_text}"
-
-        extraction_time = time.time() - start_time
-        return {
-            'pages': pages_text,
-            'full_text': full_text,
-            'num_pages': num_pages,
-            'extraction_time': extraction_time
-        }
+        pipeline = get_llm_pipeline()
+        
+        # Mock mode fallback (if model couldn't load)
+        if pipeline == "mock":
+            sources = []
+            for chunk in context_chunks[:3]:
+                pdf_name = chunk.get('pdf_name', 'Unknown Document')
+                page = chunk.get('page_number', '?')
+                text_preview = chunk['text'][:200] + "..." if len(chunk['text']) > 200 else chunk['text']
+                sources.append(f"📄 {pdf_name} (Page {page}):\n{text_preview}")
+            
+            answer = f"**Found relevant information from {len(context_chunks)} chunk(s):**\n\n"
+            answer += "\n\n---\n\n".join(sources)
+            return answer
+        
+        # Generate response with LLaMA
+        print(f"Generating answer with LLaMA for query: {query}")
+        response = pipeline(
+            prompt,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.95
+        )
+        
+        # Extract generated text
+        generated_text = response[0]['generated_text']
+        
+        # Remove the prompt from the response
+        answer = generated_text[len(prompt):].strip()
+        
+        return answer
+        
     except Exception as e:
-        print(f"Error extracting PDF: {e}")
-        raise
+        print(f"Error generating answer: {e}")
+        # Fallback response
+        pages = ', '.join([str(c['page_number']) for c in context_chunks[:5]])
+        return f"I found relevant information in the documents (Pages {pages}), but encountered an error generating a detailed response. Please try rephrasing your question."
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+def save_query_log(pdf_id: int, pdf_name: str, query: str, answer: str):
     """
-    Split text into chunks with overlap.
+    Save query and answer to database
     """
-    words = text.split()
-    chunks = []
-    # step size is chunk_size - overlap
-    step = max(1, chunk_size - overlap)
-    for i in range(0, len(words), step):
-        chunk = ' '.join(words[i:i + chunk_size])
-        if chunk.strip():
-            chunks.append(chunk)
-    return chunks
-
-
-def save_pdf_metadata(pdf_name: str, num_pages: int, full_text: str,
-                      extraction_time: float, project_code: str) -> int:
-    """
-    Save PDF metadata (including project_code) to database and return pdf_id.
-    """
+    from database import get_connection
+    
     conn = get_connection()
     cursor = conn.cursor()
+    
     try:
         cursor.execute("""
-            INSERT INTO codecatalyst.pdfs (pdf_name, project_code, number_of_pages, full_pdf_text, extraction_time_seconds)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING pdf_id
-        """, (pdf_name, project_code, num_pages, full_text, extraction_time))
-        pdf_id = cursor.fetchone()[0]
-        conn.commit()
-        return pdf_id
-    except Exception as e:
-        conn.rollback()
-        print(f"Error saving PDF metadata: {e}")
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def update_pdf_timings(pdf_id: int, embedding_time: float = None, storage_time: float = None):
-    """
-    Update PDF processing timings.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        if embedding_time is not None:
-            cursor.execute(
-                "UPDATE codecatalyst.pdfs SET embedding_time_seconds = %s WHERE pdf_id = %s",
-                (embedding_time, pdf_id)
-            )
-        if storage_time is not None:
-            cursor.execute(
-                "UPDATE codecatalyst.pdfs SET storage_time_seconds = %s WHERE pdf_id = %s",
-                (storage_time, pdf_id)
-            )
+            INSERT INTO query_logs (pdf_id, pdf_name, user_query, llm_answer)
+            VALUES (%s, %s, %s, %s)
+        """, (pdf_id, pdf_name, query, answer))
+        
         conn.commit()
     except Exception as e:
         conn.rollback()
-        print(f"Error updating PDF timings: {e}")
+        print(f"Error saving query log: {e}")
         raise
     finally:
         cursor.close()
