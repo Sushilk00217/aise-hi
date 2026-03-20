@@ -1,403 +1,433 @@
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import os
+import time
+from sentence_transformers import SentenceTransformer
+from database import get_connection
 from dotenv import load_dotenv
-import json
-from typing import Any, Dict, List, Optional
+from typing import Optional, List
 
 load_dotenv()
 
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '192.168.20.62'),
-    'port': os.getenv('DB_PORT', '5432'),
-    'database': os.getenv('DB_NAME', 'CodeCatalyst'),
-    'user': os.getenv('DB_USER', 'postgres'),
-    'password': os.getenv('DB_PASSWORD', 'postgres')
-}
+# Initialize embedding model
+EMBEDDING_MODEL_NAME = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
+embedding_model = None
 
 
-DB_SCHEMA = os.getenv('DB_SCHEMA', 'codecatalyst')
+def get_embedding_model():
+    """Lazy load the embedding model"""
+    global embedding_model
+    if embedding_model is None:
+        print(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return embedding_model
 
 
-def get_connection():
-    """Get database connection with schema search_path set."""
-    conn = psycopg2.connect(**DB_CONFIG)
-    with conn.cursor() as c:
-        # Ensure unqualified names resolve to codecatalyst.*
-        c.execute(f"SET search_path TO {DB_SCHEMA}, public;")
-    return conn
-
-
-
-def init_database():
-    """Initialize database and create tables with pgvector extension"""
-    
-    # First, connect to default postgres database to create our database if needed
-    try:
-        conn = psycopg2.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            database='postgres',
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password']
-        )
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        cursor = conn.cursor()
-        
-        # Create database if it doesn't exist
-        cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (DB_CONFIG['database'],))
-        if not cursor.fetchone():
-            cursor.execute(f"CREATE DATABASE {DB_CONFIG['database']}")
-            print(f"Database {DB_CONFIG['database']} created successfully")
-        
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"Error creating database: {e}")
-    
-    # Now connect to our database and create tables
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Enable pgvector extension
-        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        
-        # Create PDFs metadata table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pdfs (
-                pdf_id SERIAL PRIMARY KEY,
-                pdf_name VARCHAR(500) UNIQUE NOT NULL,
-                number_of_pages INTEGER NOT NULL,
-                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                extraction_time_seconds FLOAT,
-                embedding_time_seconds FLOAT,
-                storage_time_seconds FLOAT,
-                full_pdf_text TEXT
-            )
-        """)
-        
-        # Create embeddings table with pgvector
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS embeddings (
-                embedding_id SERIAL PRIMARY KEY,
-                pdf_id INTEGER REFERENCES pdfs(pdf_id) ON DELETE CASCADE,
-                page_number INTEGER NOT NULL,
-                chunk_text TEXT NOT NULL,
-                embedding VECTOR(384),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create index on embeddings for faster similarity search
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS embeddings_vector_idx 
-            ON embeddings USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100)
-        """)
-        
-        # Create query logs table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS query_logs (
-                query_id SERIAL PRIMARY KEY,
-                pdf_id INTEGER REFERENCES pdfs(pdf_id) ON DELETE CASCADE,
-                pdf_name VARCHAR(500),
-                user_query TEXT NOT NULL,
-                llm_answer TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create chat sessions table for history (UUID primary key)
-        cursor.execute("""
-            CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                session_name VARCHAR(500) DEFAULT 'New Chat',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create chat messages table (UUID foreign key)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                message_id SERIAL PRIMARY KEY,
-                session_id UUID REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
-                role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant')),
-                content TEXT NOT NULL,
-                pdf_references TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        conn.commit()
-        print("Database initialized successfully with all tables")
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"Error initializing database: {e}")
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def check_pdf_exists(pdf_name: str) -> bool:
-    """Check if PDF already exists in database"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT 1 FROM codecatalyst.pdfs WHERE pdf_name = %s", (pdf_name,))
-        exists = cursor.fetchone() is not None
-        return exists
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def delete_all_pdfs():
-    """Delete all PDFs and their embeddings"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Delete all embeddings (cascade will handle this, but being explicit)
-        cursor.execute("DELETE FROM codecatalyst.embeddings")
-        cursor.execute("DELETE FROM codecatalyst.query_logs")
-        cursor.execute("DELETE FROM codecatalyst.pdfs")
-        conn.commit()
-        print("All PDFs and embeddings deleted successfully")
-    except Exception as e:
-        conn.rollback()
-        print(f"Error deleting PDFs: {e}")
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def get_latest_pdf():
-    """Get the most recently uploaded PDF"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            SELECT pdf_id, pdf_name, number_of_pages, upload_date 
-            FROM codecatalyst.pdfs 
-            ORDER BY upload_date DESC 
-            LIMIT 1
-        """)
-        result = cursor.fetchone()
-        if result:
-            return {
-                'pdf_id': result[0],
-                'pdf_name': result[1],
-                'number_of_pages': result[2],
-                'upload_date': result[3]
-            }
-        return None
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def create_chat_session(session_name: str = "New Chat"):
-    """Create a new chat session"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            INSERT INTO codecatalyst.chat_sessions (session_name)
-            VALUES (%s)
-            RETURNING session_id, session_name, created_at
-        """, (session_name,))
-        result = cursor.fetchone()
-        conn.commit()
-        return {
-            'session_id': result[0],
-            'session_name': result[1],
-            'created_at': result[2]
-        }
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def get_all_chat_sessions():
-    """Get all chat sessions ordered by most recent"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            SELECT s.session_id, s.session_name, s.created_at, s.updated_at,
-                   COUNT(m.message_id) as message_count
-            FROM codecatalyst.chat_sessions s
-            LEFT JOIN codecatalyst.chat_messages m ON s.session_id = m.session_id
-            GROUP BY s.session_id, s.session_name, s.created_at, s.updated_at
-            ORDER BY s.updated_at DESC
-        """)
-        sessions = []
-        for row in cursor.fetchall():
-            sessions.append({
-                'session_id': row[0],
-                'session_name': row[1],
-                'created_at': row[2],
-                'updated_at': row[3],
-                'message_count': row[4]
-            })
-        return sessions
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def get_chat_history(session_id: str):
-    """Get all messages for a specific chat session"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            SELECT message_id, role, content, pdf_references, created_at
-            FROM codecatalyst.chat_messages
-            WHERE session_id = %s
-            ORDER BY created_at ASC
-        """, (session_id,))
-        messages = []
-        for row in cursor.fetchall():
-            mid, role, raw_content, pdf_refs, created_at = row
-            if role == "assistant":
-                # Parse the JSON envelope we saved
-                try:
-                    parsed = json.loads(raw_content)
-                except Exception:
-                    parsed = {"answer": raw_content, "sources": [], "pdf_references": pdf_refs}
-                messages.append({
-                    "message_id": mid,
-                    "role": role,
-                    "content": parsed,            # object: {answer, sources, pdf_references}
-                    "pdf_references": None,       # already inside content
-                    "created_at": created_at
-                })
-            else:
-                messages.append({
-                    "message_id": mid,
-                    "role": role,
-                    "content": raw_content,        # plain text for user messages
-                    "pdf_references": pdf_refs,
-                    "created_at": created_at
-                })
-        return messages
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def save_chat_message(
-    session_id: str,
-    role: str,
-    content: Any,                     # string OR dict (for assistant envelope)
-    pdf_references: Optional[str] = None,
-    *,
-    sources: Optional[List[Dict]] = None   # optional kwarg; old callers still work
-):
-    """Save a chat message to a session.
-
-    - For role == "assistant":
-        Stores a canonical JSON envelope in chat_messages.content:
-          {"answer": <string|object>, "sources": <list>, "pdf_references": <string|null>}
-        You may pass:
-          - content as a dict (already an envelope)  -> will be json-dumped as-is
-          - content as a string (answer text or JSON string) + sources list -> envelope will be built
-    - For other roles: stores content as-is (string).
+def generate_embeddings(texts: List[str]) -> List[List[float]]:
     """
+    Generate embeddings for a list of texts using Gemma/SentenceTransformer
+    """
+    model = get_embedding_model()
+    embeddings = model.encode(texts, show_progress_bar=True)
+    return embeddings.tolist()
+
+
+def store_embeddings(pdf_id: int, project_code: str, pages_data: List[dict], chunk_size: int = 500):
+    """
+    Generate and store embeddings for PDF chunks, tagging each row with project_code
+    so we can search across all documents within the same project later.
+    """
+    from pdf_processor import chunk_text
+    start_time = time.time()
+
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        content_to_store = content
+        all_chunks = []
+        chunk_metadata = []
 
-        if role == "assistant":
-            def _looks_like_json(s: str) -> bool:
-                s = (s or "").strip()
-                return s.startswith("{") and s.endswith("}")
+        # Create chunks from each page
+        for page_data in pages_data:
+            page_num = page_data['page_number']
+            page_text = page_data['text']
+            if not page_text or not page_text.strip():
+                continue
 
-            if isinstance(content, dict):
-                # Already a rich structure: ensure keys exist
-                envelope: Dict[str, Any] = {
-                    "answer": content.get("answer", content),
-                    "sources": content.get("sources", sources or []),
-                    "pdf_references": content.get("pdf_references", pdf_references),
+            chunks = chunk_text(page_text, chunk_size=chunk_size)
+            for chunk in chunks:
+                all_chunks.append(chunk)
+                chunk_metadata.append({
+                    'page_number': page_num,
+                    'text': chunk
+                })
+
+        if not all_chunks:
+            print("No chunks to process")
+            return
+
+        print(f"Generating embeddings for {len(all_chunks)} chunks...")
+        embeddings = generate_embeddings(all_chunks)
+        embedding_time = time.time() - start_time
+
+        # Store embeddings in database (single commit for the whole batch)
+        storage_start = time.time()
+        insert_sql = """
+            INSERT INTO codecatalyst.embeddings (pdf_id, project_code, page_number, chunk_text, embedding)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        for metadata, embedding in zip(chunk_metadata, embeddings):
+            cursor.execute(
+                insert_sql,
+                (pdf_id, project_code, metadata['page_number'], metadata['text'], embedding)
+            )
+        conn.commit()
+
+        storage_time = time.time() - storage_start
+        print(f"Stored {len(embeddings)} embeddings successfully")
+
+        # Update PDF metadata with timing information
+        from pdf_processor import update_pdf_timings
+        update_pdf_timings(pdf_id, embedding_time=embedding_time, storage_time=storage_time)
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error storing embeddings: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+
+
+from sentence_transformers import SentenceTransformer
+
+def _to_vector_literal(vec: List[float]) -> str:
+    # pgvector accepts text like: [0.123, 0.456, ...]
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+
+# --- helpers: keep near the top of embeddings.py ---
+from typing import Optional, List
+from database import get_connection
+
+def _to_vector_literal(vec: List[float]) -> str:
+    """Format a Python list as a pgvector literal string: [0.123456,0.234567,...]"""
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+def build_tsquery(query: str) -> str:
+    """
+    Very small normalizer that expands common synonyms/variants so FTS can match natural questions:
+    - ICAO  ->  (icao | (international & civil & aviation & organization))
+    - practices/practises/practice  -> OR-grouped
+    You can extend this dict for your domain.
+    """
+    q = (query or "").lower().strip()
+
+    expansions = {
+        "icao": "(icao | (international & civil & aviation & organization))",
+    }
+
+    tokens = q.replace("?", " ").replace(",", " ").split()
+    groups: List[str] = []
+    for t in tokens:
+        if t in ("practices", "practises", "practice"):
+            groups.append("(practices | practises | practice)")
+        elif t in expansions:
+            groups.append(expansions[t])
+        else:
+            groups.append(t)
+
+    # Join groups with AND; inside a group we already used OR
+    return " & ".join(groups) if groups else ""
+
+def search_similar_chunks(
+    query: str,
+    project_code: Optional[str] = None,
+    pdf_id: Optional[int] = None,
+    similarity_threshold: float = 0.20,   # now applied AFTER fetch (optional)
+    keyword_weight: float = 0.5,
+    vector_weight: float = 0.5,
+    top_k: int = 10
+) -> List[dict]:
+    """
+    Hybrid search (vector + keyword) that is resilient to natural questions.
+    - No SQL WHERE cutoff; we ORDER BY combined_score and LIMIT, then optionally filter in Python.
+    - If hybrid returns no rows, do a vector-only fallback within the same scope.
+    - Returns pdf_id to support mapping to documents.llm_doc_id.
+    """
+    print(f"Starting search_similar_chunks with query: {query}, "
+          f"project_code: {project_code}, pdf_id: {pdf_id}, "
+          f"similarity_threshold: {similarity_threshold}")
+    print(f"Weights - keyword_weight: {keyword_weight}, vector_weight: {vector_weight}")
+
+    model = get_embedding_model()  # already defined earlier in this file
+    query_embedding = model.encode([query])[0].tolist()
+    query_vec = _to_vector_literal(query_embedding)  # reliable ::vector cast
+    ts_query = build_tsquery(query)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # ---------- Project-scoped search across ALL PDFs in the project ----------
+        if project_code:
+            print("Performing hybrid search within a project (all PDFs under project_code)...")
+            cursor.execute("""
+                WITH vector_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        1 - (e.embedding <=> %s::vector) AS vector_similarity
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                    WHERE e.project_code = %s
+                ),
+                keyword_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        ts_rank(
+                            to_tsvector('english', e.chunk_text),
+                            to_tsquery('english', %s)
+                        ) AS keyword_score
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                    WHERE e.project_code = %s
+                )
+                SELECT
+                    v.chunk_text,
+                    v.page_number,
+                    v.pdf_name,
+                    v.pdf_id,
+                    v.vector_similarity,
+                    COALESCE(k.keyword_score, 0) AS keyword_score,
+                    (%s * v.vector_similarity + %s * COALESCE(k.keyword_score, 0)) AS combined_score
+                FROM vector_scores v
+                LEFT JOIN keyword_scores k ON v.embedding_id = k.embedding_id
+                ORDER BY combined_score DESC
+                LIMIT %s
+            """, (
+                query_vec, project_code,
+                ts_query, project_code,
+                vector_weight, keyword_weight,
+                top_k
+            ))
+
+            rows = cursor.fetchall()
+            similar_chunks: List[dict] = [
+                {
+                    'text': r[0],
+                    'page_number': r[1],
+                    'pdf_name': r[2],
+                    'pdf_id': r[3],
+                    'vector_similarity': float(r[4]) if r[4] is not None else 0.0,
+                    'keyword_score': float(r[5]) if r[5] is not None else 0.0,
+                    'combined_score': float(r[6]) if r[6] is not None else 0.0,
                 }
-            else:
-                # content is a string (answer text or possibly a JSON string)
-                answer_obj: Any = content
-                if isinstance(content, str) and _looks_like_json(content):
-                    # Keep the JSON string as-is under "answer"
-                    answer_obj = content
-                envelope = {
-                    "answer": answer_obj,
-                    "sources": sources or [],
-                    "pdf_references": pdf_references,
+                for r in rows
+            ]
+
+        # ---------- PDF-scoped search (single PDF) ----------
+        elif pdf_id:
+            print("Performing hybrid search in specific PDF...")
+            cursor.execute("""
+                WITH vector_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        1 - (e.embedding <=> %s::vector) AS vector_similarity
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                    WHERE e.pdf_id = %s
+                ),
+                keyword_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        ts_rank(
+                            to_tsvector('english', e.chunk_text),
+                            to_tsquery('english', %s)
+                        ) AS keyword_score
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                    WHERE e.pdf_id = %s
+                )
+                SELECT
+                    v.chunk_text,
+                    v.page_number,
+                    v.pdf_name,
+                    v.pdf_id,
+                    v.vector_similarity,
+                    COALESCE(k.keyword_score, 0) AS keyword_score,
+                    (%s * v.vector_similarity + %s * COALESCE(k.keyword_score, 0)) AS combined_score
+                FROM vector_scores v
+                LEFT JOIN keyword_scores k ON v.embedding_id = k.embedding_id
+                ORDER BY combined_score DESC
+                LIMIT %s
+            """, (
+                query_vec, pdf_id,
+                ts_query, pdf_id,
+                vector_weight, keyword_weight,
+                top_k
+            ))
+
+            rows = cursor.fetchall()
+            similar_chunks = [
+                {
+                    'text': r[0],
+                    'page_number': r[1],
+                    'pdf_name': r[2],
+                    'pdf_id': r[3],
+                    'vector_similarity': float(r[4]) if r[4] is not None else 0.0,
+                    'keyword_score': float(r[5]) if r[5] is not None else 0.0,
+                    'combined_score': float(r[6]) if r[6] is not None else 0.0,
                 }
+                for r in rows
+            ]
 
-            # Persist canonical JSON string
-            content_to_store = json.dumps(envelope, ensure_ascii=False)
+        # ---------- Global search across all PDFs ----------
+        else:
+            print("Performing hybrid search across all PDFs...")
+            cursor.execute("""
+                WITH vector_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        1 - (e.embedding <=> %s::vector) AS vector_similarity
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                ),
+                keyword_scores AS (
+                    SELECT
+                        e.embedding_id,
+                        e.chunk_text,
+                        e.page_number,
+                        p.pdf_name,
+                        p.pdf_id,
+                        ts_rank(
+                            to_tsvector('english', e.chunk_text),
+                            to_tsquery('english', %s)
+                        ) AS keyword_score
+                    FROM codecatalyst.embeddings e
+                    JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                )
+                SELECT
+                    v.chunk_text,
+                    v.page_number,
+                    v.pdf_name,
+                    v.pdf_id,
+                    v.vector_similarity,
+                    COALESCE(k.keyword_score, 0) AS keyword_score,
+                    (%s * v.vector_similarity + %s * COALESCE(k.keyword_score, 0)) AS combined_score
+                FROM vector_scores v
+                LEFT JOIN keyword_scores k ON v.embedding_id = k.embedding_id
+                ORDER BY combined_score DESC
+                LIMIT %s
+            """, (
+                query_vec, query,  # for to_tsquery we pass the normalized query string below if desired
+                vector_weight, keyword_weight,
+                top_k
+            ))
 
-        cursor.execute("""
-            INSERT INTO codecatalyst.chat_messages (session_id, role, content, pdf_references)
-            VALUES (%s, %s, %s, %s)
-            RETURNING message_id
-        """, (session_id, role, content_to_store, pdf_references))
-        message_id = cursor.fetchone()[0]
+            rows = cursor.fetchall()
+            similar_chunks = [
+                {
+                    'text': r[0],
+                    'page_number': r[1],
+                    'pdf_name': r[2],
+                    'pdf_id': r[3],
+                    'vector_similarity': float(r[4]) if r[4] is not None else 0.0,
+                    'keyword_score': float(r[5]) if r[5] is not None else 0.0,
+                    'combined_score': float(r[6]) if r[6] is not None else 0.0,
+                }
+                for r in rows
+            ]
 
-        # Touch session.updated_at
-        cursor.execute("""
-            UPDATE codecatalyst.chat_sessions
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = %s
-        """, (session_id,))
+        # ---------- Optional: apply a gentle cutoff in Python ----------
+        if similarity_threshold is not None and similarity_threshold > 0:
+            before = len(similar_chunks)
+            similar_chunks = [c for c in similar_chunks if c.get('combined_score', 0.0) >= similarity_threshold]
+            print(f"Filtered by threshold from {before} -> {len(similar_chunks)}")
 
-        conn.commit()
-        return message_id
+        # ---------- Fallback #1: vector-only (project scope), if nothing survived ----------
+        if not similar_chunks and project_code:
+            print("No hybrid hits. Falling back to vector-only search within project_code...")
+            cursor.execute("""
+                SELECT
+                    e.chunk_text,
+                    e.page_number,
+                    p.pdf_name,
+                    p.pdf_id,
+                    1 - (e.embedding <=> %s::vector) AS vector_similarity
+                FROM codecatalyst.embeddings e
+                JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                WHERE e.project_code = %s
+                ORDER BY vector_similarity DESC
+                LIMIT %s
+            """, (query_vec, project_code, top_k))
+            rows = cursor.fetchall()
+            for r in rows:
+                similar_chunks.append({
+                    'text': r[0],
+                    'page_number': r[1],
+                    'pdf_name': r[2],
+                    'pdf_id': r[3],
+                    'vector_similarity': float(r[4]) if r[4] is not None else 0.0,
+                    'keyword_score': 0.0,
+                    'combined_score': float(r[4]) if r[4] is not None else 0.0,
+                })
+
+        # ---------- Fallback #2: keyword-only (project scope), if still empty ----------
+        if not similar_chunks and project_code:
+            print("Still empty. Falling back to keyword-only search within project_code...")
+            cursor.execute("""
+                SELECT
+                    e.chunk_text,
+                    e.page_number,
+                    p.pdf_name,
+                    p.pdf_id,
+                    0.0 AS vector_similarity,
+                    ts_rank(
+                        to_tsvector('english', e.chunk_text),
+                        to_tsquery('english', %s)
+                    ) AS keyword_score
+                FROM codecatalyst.embeddings e
+                JOIN codecatalyst.pdfs p ON e.pdf_id = p.pdf_id
+                WHERE e.project_code = %s
+                  AND to_tsvector('english', e.chunk_text) @@ to_tsquery('english', %s)
+                ORDER BY keyword_score DESC
+                LIMIT %s
+            """, (ts_query, project_code, ts_query, top_k))
+            rows = cursor.fetchall()
+            for r in rows:
+                similar_chunks.append({
+                    'text': r[0],
+                    'page_number': r[1],
+                    'pdf_name': r[2],
+                    'pdf_id': r[3],
+                    'vector_similarity': float(r[4]) if r[4] is not None else 0.0,
+                    'keyword_score': float(r[5]) if r[5] is not None else 0.0,
+                    'combined_score': float(r[5]) if r[5] is not None else 0.0,
+                })
+
+        print(f"Formatted similar chunks: {similar_chunks}")
+        return similar_chunks
+
     finally:
         cursor.close()
         conn.close()
 
 
-def update_session_name(session_id: str, new_name: str):
-    """Update chat session name"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("""
-            UPDATE codecatalyst.chat_sessions 
-            SET session_name = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = %s
-        """, (new_name, session_id))
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def delete_chat_session(session_id: str):
-    """Delete a chat session and all its messages"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("DELETE FROM codecatalyst.chat_sessions WHERE session_id = %s", (session_id,))
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
-
-
-if __name__ == "__main__":
-    # Initialize database when run directly
-    init_database()
